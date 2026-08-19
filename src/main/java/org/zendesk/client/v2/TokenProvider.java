@@ -3,6 +3,8 @@ package org.zendesk.client.v2;
 /**
  * Supplies a currently-usable bearer token. Called on every request from many threads at once, so
  * implementations must be thread-safe and may block while a token is minted.
+ *
+ * @since FIXME
  */
 interface TokenProvider {
 

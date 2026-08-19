@@ -3,6 +3,7 @@ package org.zendesk.client.v2;
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
 import static com.github.tomakehurst.wiremock.client.WireMock.equalTo;
 import static com.github.tomakehurst.wiremock.client.WireMock.getRequestedFor;
+import static com.github.tomakehurst.wiremock.client.WireMock.matchingJsonPath;
 import static com.github.tomakehurst.wiremock.client.WireMock.ok;
 import static com.github.tomakehurst.wiremock.client.WireMock.post;
 import static com.github.tomakehurst.wiremock.client.WireMock.postRequestedFor;
@@ -11,12 +12,20 @@ import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.options
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import com.fasterxml.jackson.core.JsonGenerator;
+import com.fasterxml.jackson.databind.JsonSerializer;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializerProvider;
+import com.fasterxml.jackson.databind.module.SimpleModule;
 import com.github.tomakehurst.wiremock.client.BasicCredentials;
 import com.github.tomakehurst.wiremock.client.WireMock;
 import com.github.tomakehurst.wiremock.junit.WireMockClassRule;
+import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Locale;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import org.apache.commons.text.RandomStringGenerator;
 import org.junit.After;
 import org.junit.Before;
@@ -91,6 +100,36 @@ public class ZendeskOAuthClientCredentialsTest {
     client.getTicketsCount();
 
     zendeskApiMock.verify(1, postRequestedFor(urlPathEqualTo("/oauth/tokens")));
+  }
+
+  @Test
+  public void tokenRequestIgnoresObjectMapperCustomizer() {
+    stubToken();
+    // Uppercases every serialized String. If the credential path shared the client's customized
+    // mapper, the client secret would be corrupted on the wire; its own mapper keeps it verbatim.
+    Function<ObjectMapper, ObjectMapper> uppercaseStrings =
+        mapper -> {
+          SimpleModule module = new SimpleModule();
+          module.addSerializer(
+              String.class,
+              new JsonSerializer<String>() {
+                @Override
+                public void serialize(
+                    String value, JsonGenerator gen, SerializerProvider serializers)
+                    throws IOException {
+                  gen.writeString(value.toUpperCase(Locale.ROOT));
+                }
+              });
+          return mapper.registerModule(module);
+        };
+    client = oauthBuilder().customizeObjectMapper(uppercaseStrings).build();
+
+    client.warmUp();
+
+    zendeskApiMock.verify(
+        postRequestedFor(urlPathEqualTo("/oauth/tokens"))
+            .withRequestBody(matchingJsonPath("$.client_secret", equalTo(CLIENT_SECRET)))
+            .withRequestBody(matchingJsonPath("$.grant_type", equalTo("client_credentials"))));
   }
 
   @Test

@@ -124,7 +124,10 @@ public class Zendesk implements Closeable {
   private final Realm realm;
   private final String url;
   private final String oauthToken;
+
+  /** Mints and caches access tokens for OAuth client-credentials authentication. */
   private final TokenProvider tokenProvider;
+
   private final Map<String, String> headers;
   private final int cbpPageSize;
   private final ObjectMapper mapper;
@@ -256,7 +259,6 @@ public class Zendesk implements Closeable {
         new SharedFutureTokenProvider(
             new HttpTokenMinter(
                 this.client,
-                this.mapper,
                 baseHostUrl,
                 clientId,
                 clientSecret,
@@ -273,7 +275,7 @@ public class Zendesk implements Closeable {
    * does nothing when there is nothing to prepare.
    *
    * @throws ZendeskOAuthException if minting fails
-   * @since 1.5.3
+   * @since FIXME
    */
   public void warmUp() {
     if (tokenProvider != null) {
@@ -4411,10 +4413,16 @@ public class Zendesk implements Closeable {
     /**
      * Default requested token lifetime. 30 minutes: short enough to limit the exposure of a leaked
      * token, long enough to keep minting infrequent.
+     *
+     * @since FIXME
      */
     public static final int DEFAULT_OAUTH_TOKEN_LIFETIME_SECONDS = 1800;
 
-    /** Default refresh threshold. Refreshes when the current token has half its lifetime left. */
+    /**
+     * Default refresh threshold. Refreshes when the current token has half its lifetime left.
+     *
+     * @since FIXME
+     */
     public static final double DEFAULT_OAUTH_REFRESH_THRESHOLD = 0.5;
 
     private static final int MIN_OAUTH_TOKEN_LIFETIME_SECONDS = 300;
@@ -4496,7 +4504,7 @@ public class Zendesk implements Closeable {
      * @param clientSecret the OAuth client's secret
      * @param scope space-separated scopes to request, for example {@code "tickets:read"}
      * @return this builder instance
-     * @since 1.5.3
+     * @since FIXME
      */
     public Builder setOauthClientCredentials(String clientId, String clientSecret, String scope) {
       this.oauthClientId = clientId;
@@ -4518,7 +4526,7 @@ public class Zendesk implements Closeable {
      *
      * @param oauthTokenLifetimeSeconds seconds a minted token should remain valid
      * @return this builder instance
-     * @since 1.5.3
+     * @since FIXME
      */
     public Builder setOauthTokenLifetimeSeconds(int oauthTokenLifetimeSeconds) {
       this.oauthTokenLifetimeSeconds = oauthTokenLifetimeSeconds;
@@ -4532,7 +4540,7 @@ public class Zendesk implements Closeable {
      *
      * @param oauthRefreshThreshold fraction of the lifetime that may remain before refreshing
      * @return this builder instance
-     * @since 1.5.3
+     * @since FIXME
      */
     public Builder setOauthRefreshThreshold(double oauthRefreshThreshold) {
       this.oauthRefreshThreshold = oauthRefreshThreshold;

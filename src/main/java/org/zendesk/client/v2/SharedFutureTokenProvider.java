@@ -5,6 +5,8 @@ import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicReference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Caches an access token and keeps it fresh, allowing only one mint in flight at a time. A fresh
@@ -19,12 +21,17 @@ import java.util.concurrent.atomic.AtomicReference;
  * <ol>
  *   <li>The {@code synchronized} block decides only who mints; the mint runs outside it, so threads
  *       never queue behind a network round trip.
- *   <li>Both fallback paths re-check freshness against the live clock via {@link #isServable},
- *       never a verdict captured earlier, so a token that expires <em>during</em> a mint is not
- *       handed out.
+ *   <li>Both recovery paths, the leader's after a failed mint and an awaiter's after a failed
+ *       round, re-check the cached token against the live clock via {@link #isServable} before
+ *       giving up. A failed mint round does not make callers fail if the cache now contains a
+ *       servable token, and a token that expires <em>during</em> a mint is not handed out.
  * </ol>
+ *
+ * @since FIXME
  */
 final class SharedFutureTokenProvider implements TokenProvider {
+
+  private static final Logger LOGGER = LoggerFactory.getLogger(SharedFutureTokenProvider.class);
 
   private final TokenMinter minter;
   private final Clock clock;
@@ -33,11 +40,24 @@ final class SharedFutureTokenProvider implements TokenProvider {
   /** Read lock-free on the hot path; the token is immutable, so publication is safe. */
   private final AtomicReference<OAuthToken> currentToken = new AtomicReference<>();
 
+  /**
+   * Private monitor guarding {@link #inFlightRefresh}, deliberately not {@code this}, so nothing
+   * outside this class can stall or deadlock a refresh round. Held only long enough to elect a
+   * leader and not across a mint attempt.
+   */
   private final Object lock = new Object();
 
   /** Null when no refresh is in progress. Guarded by {@link #lock}. */
   private CompletableFuture<OAuthToken> inFlightRefresh;
 
+  /**
+   * Creates a provider backed by a single-flight token minter.
+   *
+   * @param minter mints tokens when the cache is empty, expired, or past the refresh threshold
+   * @param clock source of freshness and expiry decisions
+   * @param refreshThreshold fraction of token lifetime remaining below which refresh begins
+   * @throws IllegalArgumentException if {@code refreshThreshold} is not between 0 and 1 exclusive
+   */
   SharedFutureTokenProvider(TokenMinter minter, Clock clock, double refreshThreshold) {
     if (!(refreshThreshold > 0.0 && refreshThreshold < 1.0)) {
       throw new IllegalArgumentException(
@@ -48,6 +68,7 @@ final class SharedFutureTokenProvider implements TokenProvider {
     this.refreshThreshold = refreshThreshold;
   }
 
+  /** {@inheritDoc} */
   @Override
   public String provideBearerToken() {
     OAuthToken token = currentToken.get();
@@ -63,14 +84,15 @@ final class SharedFutureTokenProvider implements TokenProvider {
         refreshRound = inFlightRefresh;
         isLeader = false;
       } else {
-        refreshRound = inFlightRefresh = new CompletableFuture<>();
+        inFlightRefresh = new CompletableFuture<>();
+        refreshRound = inFlightRefresh;
         isLeader = true;
       }
     }
 
     if (isLeader) {
       return mintAsLeader(refreshRound);
-    } else if (isServable(clock, token)) {
+    } else if (isServable(token)) {
       return token.accessToken();
     } else {
       return await(refreshRound);
@@ -89,16 +111,20 @@ final class SharedFutureTokenProvider implements TokenProvider {
       // Ensure we publish the token before completing the round.
       OAuthToken minted = minter.mint();
       currentToken.set(minted);
+      LOGGER.debug("Minted a new OAuth access token that expires at {}", minted.expiresAt());
+
       refreshRound.complete(minted);
       return minted.accessToken();
     } catch (RuntimeException e) {
-      // The round fails for every awaiting thread, all sharing this exception.
-      // This thread can still continue if the cached token has not expired yet.
       refreshRound.completeExceptionally(e);
       OAuthToken fallback = currentToken.get();
-      if (isServable(clock, fallback)) {
+      if (isServable(fallback)) {
+        LOGGER.debug("OAuth access token mint failure", e);
+        LOGGER.warn("Failed to mint an OAuth access token; serving the cached token that expires at {}",
+            fallback.expiresAt());
         return fallback.accessToken();
       }
+      LOGGER.warn("Failed to mint an OAuth access token and no servable cached token remains", e);
       throw e;
     } finally {
       // Clear out the slot so that the next refresh can run when needed, and ensure
@@ -115,6 +141,27 @@ final class SharedFutureTokenProvider implements TokenProvider {
     }
   }
 
+  private String await(CompletableFuture<OAuthToken> refreshRound) {
+    try {
+      return refreshRound.get().accessToken();
+    } catch (ExecutionException e) {
+      OAuthToken cached = currentToken.get();
+      if (isServable(cached)) {
+        return cached.accessToken();
+      }
+
+      Throwable cause = e.getCause();
+      if (cause instanceof RuntimeException) {
+        throw (RuntimeException) cause;
+      }
+
+      throw new ZendeskOAuthException("Failed to obtain an OAuth access token", cause);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new ZendeskOAuthException("Interrupted while awaiting an OAuth access token", e);
+    }
+  }
+
   private boolean isFresh(OAuthToken token) {
     long lifetimeMillis = Duration.between(token.issuedAt(), token.expiresAt()).toMillis();
     long remainingMillis = Duration.between(clock.instant(), token.expiresAt()).toMillis();
@@ -122,22 +169,7 @@ final class SharedFutureTokenProvider implements TokenProvider {
   }
 
   /** Whether a given token may be handed to a thread <em>right now</em>. */
-  static boolean isServable(Clock clock, OAuthToken token) {
+  boolean isServable(OAuthToken token) {
     return token != null && clock.instant().isBefore(token.expiresAt());
-  }
-
-  private String await(CompletableFuture<OAuthToken> refreshRound) {
-    try {
-      return refreshRound.get().accessToken();
-    } catch (ExecutionException e) {
-      Throwable cause = e.getCause();
-      if (cause instanceof RuntimeException) {
-        throw (RuntimeException) cause;
-      }
-      throw new ZendeskOAuthException("Failed to obtain an OAuth access token", cause);
-    } catch (InterruptedException e) {
-      Thread.currentThread().interrupt();
-      throw new ZendeskOAuthException("Interrupted while awaiting an OAuth access token", e);
-    }
   }
 }

@@ -94,18 +94,19 @@ public class SharedFutureTokenProviderTest {
   @Test
   public void servableTokenBoundary() {
     var token = new OAuthToken("token", T0, T0.plus(LIFETIME));
+    var provider = new SharedFutureTokenProvider(new FakeMinter(clock), clock, REFRESH_THRESHOLD);
 
-    assertThat(SharedFutureTokenProvider.isServable(clock, null)).isFalse();
+    assertThat(provider.isServable(null)).isFalse();
 
-    assertThat(SharedFutureTokenProvider.isServable(clock, token)).isTrue();
+    assertThat(provider.isServable(token)).isTrue();
 
     // Right before expiry
     clock.advance(LIFETIME.minusMillis(1));
-    assertThat(SharedFutureTokenProvider.isServable(clock, token)).isTrue();
+    assertThat(provider.isServable(token)).isTrue();
 
     // At expiry time
     clock.advance(Duration.ofMillis(1));
-    assertThat(SharedFutureTokenProvider.isServable(clock, token)).isFalse();
+    assertThat(provider.isServable(token)).isFalse();
   }
 
   @Test
@@ -351,6 +352,53 @@ public class SharedFutureTokenProviderTest {
     gate.countDown();
   }
 
+  @Test
+  public void awaiterFallsBackToServableTokenWhenLeaderMintFails() throws Exception {
+    var minter = new FakeMinter();
+    var provider = provider(minter);
+
+    // Reproduces a caller that captured an expired token, then waited on a failed refresh after
+    // another thread had already published a servable token.
+    assertThat(provider.provideBearerToken()).isEqualTo("tok-1");
+    clock.advance(PAST_EXPIRY);
+
+    var pool = pool(2);
+    var awaiter =
+        pool.submit(
+            () -> {
+              clock.stopThreadAtNextFreshnessCheck(Thread.currentThread());
+              return call(provider);
+            });
+    clock.awaitThreadStoppedAfterTokenSnapshot();
+
+    // Publish a fresh token while the awaiter still holds its expired snapshot.
+    assertThat(provider.provideBearerToken()).isEqualTo("tok-2");
+
+    // Start a failed refresh round that the awaiter will join.
+    clock.advance(INTO_REFRESH_WINDOW);
+    var gate = new CountDownLatch(1);
+    minter.freezeMintUntil(gate);
+    minter.failWith(new ZendeskOAuthException("mint failed"));
+    var leader = startMintingLeader(pool, provider, minter);
+
+    // Release the awaiter after it rejects its expired snapshot and joins the in-flight round.
+    clock.resumeStoppedThread();
+    clock.awaitExpiredSnapshotRejected();
+
+    gate.countDown();
+
+    var leaderResult = leader.get(5, TimeUnit.SECONDS);
+    var awaiterResult = awaiter.get(5, TimeUnit.SECONDS);
+
+    assertThat(leaderResult.value())
+        .as("leader serves the servable cached token")
+        .isEqualTo("tok-2");
+    assertThat(awaiterResult.succeeded())
+        .as("awaiter must fall back to the servable cached token, not inherit the failed mint")
+        .isTrue();
+    assertThat(awaiterResult.value()).isEqualTo("tok-2");
+  }
+
   //////////////////////////////////////////////////////////////////////
   // Test helpers
   //////////////////////////////////////////////////////////////////////
@@ -488,9 +536,9 @@ public class SharedFutureTokenProviderTest {
     private final AtomicInteger mintCount = new AtomicInteger();
     private final AtomicInteger threadsInsideMint = new AtomicInteger();
     private final AtomicInteger peakConcurrentMints = new AtomicInteger();
+    private final AtomicReference<MintBehavior> behavior =
+        new AtomicReference<>(new MintBehavior(() -> {}, null));
     private final Clock mintClock;
-    private volatile Runnable insideMint = () -> {};
-    private volatile Throwable failWith;
 
     FakeMinter() {
       this(SharedFutureTokenProviderTest.this.clock);
@@ -502,20 +550,21 @@ public class SharedFutureTokenProviderTest {
 
     /** Parks every mint inside {@link #mint()} until the latch opens. */
     void freezeMintUntil(CountDownLatch gate) {
-      insideMint = () -> awaitLatch(gate);
+      behavior.updateAndGet(current -> new MintBehavior(() -> awaitLatch(gate), current.failure));
     }
 
     /** Moves the clock on while a mint is in progress, to age a token mid-refresh. */
     void advanceClockDuringMint(Duration delta) {
-      insideMint = () -> clock.advance(delta);
+      behavior.updateAndGet(
+          current -> new MintBehavior(() -> clock.advance(delta), current.failure));
     }
 
     void failWith(Throwable failure) {
-      failWith = failure;
+      behavior.updateAndGet(current -> new MintBehavior(current.insideMint, failure));
     }
 
     void stopFailing() {
-      failWith = null;
+      behavior.updateAndGet(current -> new MintBehavior(current.insideMint, null));
     }
 
     @Override
@@ -523,11 +572,12 @@ public class SharedFutureTokenProviderTest {
       peakConcurrentMints.accumulateAndGet(threadsInsideMint.incrementAndGet(), Math::max);
       try {
         var n = mintCount.incrementAndGet();
+        var currentBehavior = behavior.get();
 
-        insideMint.run();
+        currentBehavior.insideMint.run();
 
-        if (failWith != null) {
-          sneakyThrow(failWith);
+        if (currentBehavior.failure != null) {
+          sneakyThrow(currentBehavior.failure);
         }
 
         var issuedAt = mintClock.instant();
@@ -538,9 +588,30 @@ public class SharedFutureTokenProviderTest {
     }
   }
 
-  /** A clock the test moves by hand, to drive a token fresh -> stale -> expired with no waiting. */
+  private static final class MintBehavior {
+    private final Runnable insideMint;
+    private final Throwable failure;
+
+    MintBehavior(Runnable insideMint, Throwable failure) {
+      this.insideMint = insideMint;
+      this.failure = failure;
+    }
+  }
+
+  /**
+   * A clock the test moves by hand, to drive a token fresh -> stale -> expired with no waiting.
+   *
+   * <p>One regression test also uses it to hold a caller after the token snapshot but before
+   * refresh election. The held caller is later released and observed when it re-checks that expired
+   * snapshot. Every other thread reads the clock normally.
+   */
   private static final class MutableClock extends Clock {
     private final AtomicReference<Instant> now;
+    private final CountDownLatch stoppedAfterTokenSnapshot = new CountDownLatch(1);
+    private final CountDownLatch resumeStoppedThread = new CountDownLatch(1);
+    private final CountDownLatch expiredSnapshotRejected = new CountDownLatch(1);
+    private final AtomicInteger stoppedThreadClockReads = new AtomicInteger();
+    private volatile Thread stoppedThread;
 
     MutableClock(Instant start) {
       this.now = new AtomicReference<>(start);
@@ -550,8 +621,38 @@ public class SharedFutureTokenProviderTest {
       now.updateAndGet(instant -> instant.plus(delta));
     }
 
+    /**
+     * Stops {@code thread} when it next checks token freshness, after it has captured its token
+     * snapshot, but before it can elect or join a refresh round.
+     */
+    void stopThreadAtNextFreshnessCheck(Thread thread) {
+      stoppedThread = thread;
+    }
+
+    void awaitThreadStoppedAfterTokenSnapshot() {
+      awaitLatch(stoppedAfterTokenSnapshot);
+    }
+
+    void resumeStoppedThread() {
+      resumeStoppedThread.countDown();
+    }
+
+    /** Blocks until the stopped thread re-checks and rejects its expired token snapshot. */
+    void awaitExpiredSnapshotRejected() {
+      awaitLatch(expiredSnapshotRejected);
+    }
+
     @Override
     public Instant instant() {
+      if (Thread.currentThread() == stoppedThread) {
+        int read = stoppedThreadClockReads.incrementAndGet();
+        if (read == 1) {
+          stoppedAfterTokenSnapshot.countDown();
+          awaitLatch(resumeStoppedThread);
+        } else if (read == 2) {
+          expiredSnapshotRejected.countDown();
+        }
+      }
       return now.get();
     }
 

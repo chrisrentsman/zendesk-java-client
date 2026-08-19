@@ -12,7 +12,6 @@ import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.options
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.tomakehurst.wiremock.junit.WireMockClassRule;
 import java.time.Clock;
 import java.time.Instant;
@@ -285,13 +284,6 @@ public class HttpTokenMinterTest {
 
   private HttpTokenMinter minter(int requestedLifetimeSeconds, Clock clock) {
     return new HttpTokenMinter(
-        httpClient,
-        new ObjectMapper(),
-        baseHostUrl,
-        CLIENT_ID,
-        CLIENT_SECRET,
-        SCOPE,
-        requestedLifetimeSeconds,
-        clock);
+        httpClient, baseHostUrl, CLIENT_ID, CLIENT_SECRET, SCOPE, requestedLifetimeSeconds, clock);
   }
 }
