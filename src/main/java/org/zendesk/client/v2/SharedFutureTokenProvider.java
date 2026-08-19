@@ -2,6 +2,7 @@ package org.zendesk.client.v2;
 
 import java.time.Clock;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicReference;
@@ -15,6 +16,10 @@ import org.slf4j.LoggerFactory;
  *
  * <p>Refresh is single-flight but synchronous: the elected thread performs the mint before
  * returning, even when its previous token is still valid.
+ *
+ * <p>After a failed proactive refresh, later callers suppress proactive refresh attempts briefly
+ * while the cached token remains servable. Cold starts and expired tokens still attempt to mint
+ * immediately.
  *
  * <p>Two invariants a future change must preserve:
  *
@@ -32,6 +37,7 @@ import org.slf4j.LoggerFactory;
 final class SharedFutureTokenProvider implements TokenProvider {
 
   private static final Logger LOGGER = LoggerFactory.getLogger(SharedFutureTokenProvider.class);
+  private static final Duration FAILED_REFRESH_BACKOFF = Duration.ofSeconds(30);
 
   private final TokenMinter minter;
   private final Clock clock;
@@ -39,6 +45,8 @@ final class SharedFutureTokenProvider implements TokenProvider {
 
   /** Read lock-free on the hot path; the token is immutable, so publication is safe. */
   private final AtomicReference<OAuthToken> currentToken = new AtomicReference<>();
+
+  private final AtomicReference<Instant> nextRefreshAttemptAt = new AtomicReference<>(Instant.MIN);
 
   /**
    * Private monitor guarding {@link #inFlightRefresh}, deliberately not {@code this}, so nothing
@@ -73,6 +81,10 @@ final class SharedFutureTokenProvider implements TokenProvider {
   public String provideBearerToken() {
     OAuthToken token = currentToken.get();
     if (token != null && isFresh(token)) {
+      return token.accessToken();
+    }
+
+    if (shouldSuppressRefresh(token)) {
       return token.accessToken();
     }
 
@@ -111,6 +123,7 @@ final class SharedFutureTokenProvider implements TokenProvider {
       // Ensure we publish the token before completing the round.
       OAuthToken minted = minter.mint();
       currentToken.set(minted);
+      nextRefreshAttemptAt.set(Instant.MIN);
       LOGGER.debug("Minted a new OAuth access token that expires at {}", minted.expiresAt());
 
       refreshRound.complete(minted);
@@ -119,8 +132,10 @@ final class SharedFutureTokenProvider implements TokenProvider {
       refreshRound.completeExceptionally(e);
       OAuthToken fallback = currentToken.get();
       if (isServable(fallback)) {
+        nextRefreshAttemptAt.set(clock.instant().plus(FAILED_REFRESH_BACKOFF));
         LOGGER.debug("OAuth access token mint failure", e);
-        LOGGER.warn("Failed to mint an OAuth access token; serving the cached token that expires at {}",
+        LOGGER.warn(
+            "Failed to mint an OAuth access token; serving the cached token that expires at {}",
             fallback.expiresAt());
         return fallback.accessToken();
       }
@@ -166,6 +181,15 @@ final class SharedFutureTokenProvider implements TokenProvider {
     long lifetimeMillis = Duration.between(token.issuedAt(), token.expiresAt()).toMillis();
     long remainingMillis = Duration.between(clock.instant(), token.expiresAt()).toMillis();
     return remainingMillis > (long) (lifetimeMillis * refreshThreshold);
+  }
+
+  private boolean shouldSuppressRefresh(OAuthToken token) {
+    if (token == null) {
+      return false;
+    }
+
+    Instant now = clock.instant();
+    return now.isBefore(token.expiresAt()) && now.isBefore(nextRefreshAttemptAt.get());
   }
 
   /** Whether a given token may be handed to a thread <em>right now</em>. */

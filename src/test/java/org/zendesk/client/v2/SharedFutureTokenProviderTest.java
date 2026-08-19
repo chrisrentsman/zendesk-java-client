@@ -30,6 +30,8 @@ public class SharedFutureTokenProviderTest {
   private static final Duration LIFETIME = Duration.ofMinutes(30);
   private static final Duration INTO_REFRESH_WINDOW = Duration.ofMinutes(20);
   private static final Duration PAST_EXPIRY = LIFETIME.plusMinutes(1);
+  private static final Duration FAILED_REFRESH_BACKOFF = Duration.ofSeconds(30);
+  private static final Duration HALF_FAILED_REFRESH_BACKOFF = Duration.ofSeconds(15);
 
   private final MutableClock clock = new MutableClock(T0);
   private final List<ExecutorService> pools = new ArrayList<>();
@@ -251,6 +253,45 @@ public class SharedFutureTokenProviderTest {
 
     clock.advance(INTO_REFRESH_WINDOW);
     assertThat(provider.provideBearerToken()).isEqualTo("tok-1");
+  }
+
+  @Test
+  public void failedProactiveRefreshSuppressesMintUntilBackoffExpires() {
+    var minter = new FakeMinter();
+    var provider = provider(minter);
+    assertThat(provider.provideBearerToken()).isEqualTo("tok-1");
+
+    minter.failWith(new ZendeskOAuthException("mint failed"));
+
+    clock.advance(INTO_REFRESH_WINDOW);
+    assertThat(provider.provideBearerToken()).isEqualTo("tok-1");
+    assertThat(provider.provideBearerToken()).isEqualTo("tok-1");
+    clock.advance(FAILED_REFRESH_BACKOFF.minusMillis(1));
+    assertThat(provider.provideBearerToken()).isEqualTo("tok-1");
+
+    assertThat(minter.mintCount).hasValue(2);
+
+    minter.stopFailing();
+    clock.advance(Duration.ofMillis(1));
+    assertThat(provider.provideBearerToken()).isEqualTo("tok-3");
+    assertThat(minter.mintCount).hasValue(3);
+  }
+
+  @Test
+  public void expiredTokenIgnoresFailedRefreshBackoff() {
+    var minter = new FakeMinter();
+    var provider = provider(minter);
+    assertThat(provider.provideBearerToken()).isEqualTo("tok-1");
+
+    minter.failWith(new ZendeskOAuthException("mint failed"));
+
+    clock.advance(LIFETIME.minus(HALF_FAILED_REFRESH_BACKOFF));
+    assertThat(provider.provideBearerToken()).isEqualTo("tok-1");
+
+    minter.stopFailing();
+    clock.advance(HALF_FAILED_REFRESH_BACKOFF);
+    assertThat(provider.provideBearerToken()).isEqualTo("tok-3");
+    assertThat(minter.mintCount).hasValue(3);
   }
 
   @Test
