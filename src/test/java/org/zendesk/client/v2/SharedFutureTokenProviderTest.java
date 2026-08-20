@@ -31,6 +31,9 @@ public class SharedFutureTokenProviderTest {
   private static final Duration INTO_REFRESH_WINDOW = Duration.ofMinutes(20);
   private static final Duration PAST_EXPIRY = LIFETIME.plusMinutes(1);
 
+  /** Must mirror {@code SharedFutureTokenProvider.MINT_FAILURE_COOLDOWN}. */
+  private static final Duration COOLDOWN = Duration.ofSeconds(10);
+
   private final MutableClock clock = new MutableClock(T0);
   private final List<ExecutorService> pools = new ArrayList<>();
 
@@ -397,6 +400,108 @@ public class SharedFutureTokenProviderTest {
         .as("awaiter must fall back to the servable cached token, not inherit the failed mint")
         .isTrue();
     assertThat(awaiterResult.value()).isEqualTo("tok-2");
+  }
+
+  //////////////////////////////////////////////////////////////////////
+  // Back-off after failed mints
+  //////////////////////////////////////////////////////////////////////
+
+  @Test
+  public void failedMintStartsCooldownSuppressingNextMintWhileServable() {
+    var minter = new FakeMinter();
+    var provider = provider(minter);
+    assertThat(provider.provideBearerToken()).isEqualTo("tok-1");
+
+    minter.failWith(new ZendeskOAuthException("mint failed"));
+    clock.advance(INTO_REFRESH_WINDOW);
+
+    // The leader mints (fails), serves the still-servable token, and arms the cooldown.
+    assertThat(provider.provideBearerToken()).isEqualTo("tok-1");
+    assertThat(minter.mintCount).hasValue(2);
+
+    // Inside the cooldown with the token still servable: no further mint, stale token served.
+    clock.advance(COOLDOWN.dividedBy(2));
+    assertThat(provider.provideBearerToken()).isEqualTo("tok-1");
+    assertThat(minter.mintCount).hasValue(2);
+  }
+
+  @Test
+  public void cooldownElapsesThenReMints() {
+    var minter = new FakeMinter();
+    var provider = provider(minter);
+    assertThat(provider.provideBearerToken()).isEqualTo("tok-1");
+
+    minter.failWith(new ZendeskOAuthException("mint failed"));
+    clock.advance(INTO_REFRESH_WINDOW);
+    assertThat(provider.provideBearerToken()).isEqualTo("tok-1");
+    assertThat(minter.mintCount).hasValue(2);
+
+    minter.stopFailing();
+    clock.advance(COOLDOWN.plusSeconds(1));
+    // Past the cooldown the leader mints again even though the cached token is still servable.
+    assertThat(provider.provideBearerToken()).isEqualTo("tok-3");
+    assertThat(minter.mintCount).hasValue(3);
+  }
+
+  @Test
+  public void coldStartMintFailureKeepsRetryingWithoutSuppression() {
+    var minter = new FakeMinter();
+    var provider = provider(minter);
+    minter.failWith(new ZendeskOAuthException("mint failed"));
+
+    assertThatThrownBy(provider::provideBearerToken).isInstanceOf(ZendeskOAuthException.class);
+    assertThat(minter.mintCount).hasValue(1);
+
+    // With no servable token there is nothing to fall back on, so the next call retries at once
+    // despite the cooldown rather than failing fast without trying.
+    assertThatThrownBy(provider::provideBearerToken).isInstanceOf(ZendeskOAuthException.class);
+    assertThat(minter.mintCount).hasValue(2);
+  }
+
+  @Test
+  public void cooldownStopsSuppressingOnceServableTokenExpires() {
+    var minter = new FakeMinter();
+    var provider = provider(minter);
+    assertThat(provider.provideBearerToken()).isEqualTo("tok-1");
+
+    // Age the token to just before expiry, then fail a mint so the cooldown outlasts the token.
+    clock.advance(LIFETIME.minusSeconds(5));
+    minter.failWith(new ZendeskOAuthException("mint failed"));
+    assertThat(provider.provideBearerToken()).isEqualTo("tok-1");
+    assertThat(minter.mintCount).hasValue(2);
+
+    // Still servable and inside the cooldown: suppressed.
+    clock.advance(Duration.ofSeconds(3));
+    assertThat(provider.provideBearerToken()).isEqualTo("tok-1");
+    assertThat(minter.mintCount).hasValue(2);
+
+    // The token has now expired while the cooldown still holds, so minting resumes.
+    minter.stopFailing();
+    clock.advance(Duration.ofSeconds(3));
+    assertThat(provider.provideBearerToken()).isEqualTo("tok-3");
+    assertThat(minter.mintCount).hasValue(3);
+  }
+
+  @Test
+  public void cooldownBoundaryAllowsMintAtExpiry() {
+    var minter = new FakeMinter();
+    var provider = provider(minter);
+    assertThat(provider.provideBearerToken()).isEqualTo("tok-1");
+
+    minter.failWith(new ZendeskOAuthException("mint failed"));
+    clock.advance(INTO_REFRESH_WINDOW);
+    assertThat(provider.provideBearerToken()).isEqualTo("tok-1");
+    assertThat(minter.mintCount).hasValue(2);
+
+    // One milli before the cooldown boundary: still suppressed.
+    clock.advance(COOLDOWN.minusMillis(1));
+    assertThat(provider.provideBearerToken()).isEqualTo("tok-1");
+    assertThat(minter.mintCount).hasValue(2);
+
+    // At the boundary the cooldown no longer holds, so a mint is attempted.
+    clock.advance(Duration.ofMillis(1));
+    assertThat(provider.provideBearerToken()).isEqualTo("tok-1");
+    assertThat(minter.mintCount).hasValue(3);
   }
 
   //////////////////////////////////////////////////////////////////////

@@ -54,7 +54,7 @@ final class HttpTokenMinter implements TokenMinter {
    * errors cannot include token-bearing response bodies.
    */
   private final ObjectMapper mapper =
-          JsonMapper.builder().disable(StreamReadFeature.INCLUDE_SOURCE_IN_LOCATION).build();
+      JsonMapper.builder().disable(StreamReadFeature.INCLUDE_SOURCE_IN_LOCATION).build();
 
   /**
    * Creates a token minter for one OAuth client.
